@@ -357,6 +357,11 @@ impl<P: ConnectionProvider> PoolState<P> {
             // that are still in-flight when a winner is found.
             let in_flight = par_servers.iter().cloned().collect::<SmallVec<[_; 2]>>();
 
+            // Whether UDP was already disabled when this batch was dispatched. Another response
+            // in the batch can disable UDP while the rest of the batch is still in flight, so the
+            // policy can't be used to tell if a truncated response came from a retry over TCP.
+            let udp_disabled_at_dispatch = policy.disable_udp;
+
             let batch_start = Instant::now();
             let mut requests = par_servers
                 .into_iter()
@@ -381,7 +386,7 @@ impl<P: ConnectionProvider> PoolState<P> {
             while let Some((server, result)) = requests.next().await {
                 completed.push(server.ip());
                 let e = match result {
-                    Ok(response) if response.truncation && policy.disable_udp => {
+                    Ok(response) if response.truncation && udp_disabled_at_dispatch => {
                         debug!("truncated response received and UDP already disabled, giving up");
                         NetError::Truncated
                     }
@@ -1974,6 +1979,73 @@ mod tests {
         assert!(
             total_queries <= 3,
             "total queries across all servers should be bounded, got {total_queries}"
+        );
+    }
+
+    /// With several servers queried concurrently, each of them can answer over UDP with a
+    /// truncated response before the first retry is dispatched. All of those responses must
+    /// be retried over TCP, rather than the later ones being treated as truncated TCP responses.
+    #[tokio::test]
+    async fn test_truncated_concurrent_servers_retry_over_tcp() {
+        subscribe();
+
+        let server1_ip = IpAddr::from([10, 0, 0, 1]);
+        let server2_ip = IpAddr::from([10, 0, 0, 2]);
+        let query_name = Name::from_str("example.com.").unwrap();
+
+        let responses = vec![
+            MockRecord::a(server1_ip, &query_name, server1_ip),
+            MockRecord::a(server2_ip, &query_name, server2_ip),
+        ];
+        // Only UDP responses are truncated, TCP responses are complete.
+        let handler = MockNetworkHandler::new(responses).with_mutation(Box::new(
+            |_destination: IpAddr, protocol: Protocol, msg: &mut Message| {
+                msg.metadata.truncation = protocol == Protocol::Udp;
+            },
+        ));
+        let provider = MockProvider::new(handler);
+
+        let opts = ResolverOpts {
+            num_concurrent_reqs: 2,
+            server_ordering_strategy: ServerOrderingStrategy::UserProvidedOrder,
+            ..ResolverOpts::default()
+        };
+
+        let pool = NameServerPool::from_nameservers(
+            vec![
+                Arc::new(NameServer::new(
+                    [].into_iter(),
+                    NameServerConfig::udp_and_tcp(server1_ip),
+                    &opts,
+                    provider.clone(),
+                )),
+                Arc::new(NameServer::new(
+                    [].into_iter(),
+                    NameServerConfig::udp_and_tcp(server2_ip),
+                    &opts,
+                    provider.clone(),
+                )),
+            ],
+            Arc::new(PoolContext::new(opts, TlsConfig::new().unwrap())),
+        );
+
+        let response = pool
+            .lookup(
+                Query::new(query_name.clone(), RecordType::A),
+                DnsRequestOptions::default(),
+            )
+            .first_answer()
+            .await
+            .expect("truncated UDP responses should be retried over TCP");
+
+        assert!(!response.truncation, "expected the complete TCP response");
+        assert_eq!(response.answers.len(), 1);
+
+        let tcp_connections = provider.count_new_connection_calls(server1_ip, Protocol::Tcp)
+            + provider.count_new_connection_calls(server2_ip, Protocol::Tcp);
+        assert!(
+            tcp_connections >= 1,
+            "expected a retry over TCP, got {tcp_connections} TCP connections"
         );
     }
 }
